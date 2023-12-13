@@ -1,0 +1,12 @@
+[package]
+name = "wasi-services-management"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+wasmtime = "15.0.1"
+thiserror = "1.0.50"
+# derive_more = "0.99.17"
+strum = { version = "0.25", features = ["derive"] }
