@@ -57,42 +57,41 @@ fn resolve_or_construct_import<'a>(
     import: ImportType<'a>,
     user: UserId,
 ) -> Option<Extern> {
-    match import.module() {
-        "host" => {
-            let host_import = match import.name() {
-                "balance" => Func::wrap(&mut store, move |caller: Caller<'_, State>| {
-                    caller.data().user_data[&user].balance.to_cents_as_i64()
-                }),
-                "order_hosting" => Func::wrap(
-                    &mut store,
-                    move |mut caller: Caller<'_, State>, days: i32| {
-                        let user_data = caller.data_mut().user_data.get_mut(&user).unwrap();
-                        let ret = match order_hosting(user_data, days) {
-                            Ok(()) => 0,
-                            Err(e) => {
-                                let discr = std::mem::discriminant(&e);
-                                let error_code = Error::iter()
-                                    .map(|err| core::mem::discriminant(&err))
-                                    .enumerate()
-                                    .find_map(|(i, d)| if d == discr { Some(i + 1) } else { None });
-                                match error_code {
-                                    Some(error_code) => {
-                                        debug_assert!(error_code > 0);
-                                        error_code
-                                    }
-                                    None => unreachable!(),
-                                }
+    if import.module() != "host" {
+        return linker.get_by_import(&mut store, &import);
+    };
+
+    let host_import = match import.name() {
+        "balance" => Func::wrap(&mut store, move |caller: Caller<'_, State>| {
+            caller.data().user_data[&user].balance.to_cents_as_i64()
+        }),
+        "order_hosting" => Func::wrap(
+            &mut store,
+            move |mut caller: Caller<'_, State>, days: i32| {
+                let user_data = caller.data_mut().user_data.get_mut(&user).unwrap();
+                let ret = match order_hosting(user_data, days) {
+                    Ok(()) => 0,
+                    Err(e) => {
+                        let discr = std::mem::discriminant(&e);
+                        let error_code = Error::iter()
+                            .map(|err| core::mem::discriminant(&err))
+                            .enumerate()
+                            .find_map(|(i, d)| if d == discr { Some(i + 1) } else { None });
+                        match error_code {
+                            Some(error_code) => {
+                                debug_assert!(error_code > 0);
+                                error_code
                             }
-                        };
-                        ret as i32
-                    },
-                ),
-                _ => return None,
-            };
-            Some(Extern::Func(host_import))
-        }
-        _ => linker.get_by_import(&mut store, &import),
-    }
+                            None => unreachable!(),
+                        }
+                    }
+                };
+                ret as i32
+            },
+        ),
+        _ => return None,
+    };
+    Some(Extern::Func(host_import))
 }
 
 fn instantiate_services_management_module(
