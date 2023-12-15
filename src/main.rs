@@ -1,7 +1,8 @@
 use std::collections::HashMap;
 
 use strum::{EnumIter, IntoEnumIterator};
-use wasmtime::{Caller, Engine, Func, Instance, Module, Store};
+use wasmtime::{Caller, Engine, Extern, Func, ImportType, Instance, Linker, Module, Store};
+use wasmtime_wasi::{sync::WasiCtxBuilder, WasiCtx};
 
 mod money;
 
@@ -19,6 +20,8 @@ enum Error {
     BalanceWouldBecomeNegative,
     #[error("The balance would underflow after the transaction.")]
     BalanceWouldUnderflow,
+    #[error("The requested import (e.g. a host function) is unknown.")]
+    UnknownImport,
 }
 
 struct UserData {
@@ -27,6 +30,7 @@ struct UserData {
 }
 
 struct State {
+    wasi_ctx: WasiCtx,
     user_data: HashMap<UserId, UserData>,
 }
 
@@ -47,43 +51,62 @@ fn order_hosting(user_data: &mut UserData, days: i32) -> Result<(), Error> {
     Ok(())
 }
 
+fn resolve_or_construct_import<'a>(
+    linker: &Linker<State>,
+    mut store: &mut Store<State>,
+    import: ImportType<'a>,
+    user: UserId,
+) -> Option<Extern> {
+    match import.module() {
+        "host" => {
+            let host_import = match import.name() {
+                "balance" => Func::wrap(&mut store, move |caller: Caller<'_, State>| {
+                    caller.data().user_data[&user].balance.to_cents_as_i64()
+                }),
+                "order_hosting" => Func::wrap(
+                    &mut store,
+                    move |mut caller: Caller<'_, State>, days: i32| {
+                        let user_data = caller.data_mut().user_data.get_mut(&user).unwrap();
+                        let ret = match order_hosting(user_data, days) {
+                            Ok(()) => 0,
+                            Err(e) => {
+                                let discr = std::mem::discriminant(&e);
+                                let error_code = Error::iter()
+                                    .map(|err| core::mem::discriminant(&err))
+                                    .enumerate()
+                                    .find_map(|(i, d)| if d == discr { Some(i + 1) } else { None });
+                                match error_code {
+                                    Some(error_code) => {
+                                        debug_assert!(error_code > 0);
+                                        error_code
+                                    }
+                                    None => unreachable!(),
+                                }
+                            }
+                        };
+                        ret as i32
+                    },
+                ),
+                _ => return None,
+            };
+            Some(Extern::Func(host_import))
+        }
+        _ => linker.get_by_import(&mut store, &import),
+    }
+}
+
 fn instantiate_services_management_module(
-    mut store: &mut SMStore,
+    linker: &Linker<State>,
+    store: &mut SMStore,
     user: UserId,
     module: &Module,
-) -> Result<Instance, wasmtime::Error> {
-    let balance_fn = Func::wrap(&mut store, move |caller: Caller<'_, State>| {
-        caller.data().user_data[&user].balance.to_cents_as_i64()
-    });
-    let order_hosting_fn = Func::wrap(
-        &mut store,
-        move |mut caller: Caller<'_, State>, days: i32| {
-            let user_data = caller.data_mut().user_data.get_mut(&user).unwrap();
-            let ret = match order_hosting(user_data, days) {
-                Ok(()) => 0,
-                Err(e) => {
-                    let discr = std::mem::discriminant(&e);
-                    let error_code = Error::iter()
-                        .map(|err| core::mem::discriminant(&err))
-                        .enumerate()
-                        .find_map(|(i, d)| if d == discr { Some(i + 1) } else { None });
-                    match error_code {
-                        Some(error_code) => {
-                            debug_assert!(error_code > 0);
-                            error_code
-                        }
-                        None => unreachable!(),
-                    }
-                }
-            };
-            ret as i32
-        },
-    );
-    let instance = Instance::new(
-        store,
-        &module,
-        &[balance_fn.into(), order_hosting_fn.into()],
-    )?;
+) -> Result<Instance, Error> {
+    let imports = module
+        .imports()
+        .map(|import| resolve_or_construct_import(linker, store, import, user))
+        .collect::<Option<Vec<Extern>>>()
+        .ok_or(Error::UnknownImport)?;
+    let instance = Instance::new(store, &module, &imports).unwrap();
     Ok(instance)
 }
 
@@ -91,11 +114,11 @@ fn main() {
     let engine = Engine::default();
     let wat = r#"
         (module
-            (import "host" "host_func" (func $balance (result i64)))
-            (import "host" "host_func" (func $order_hosting (param i32) (result i32)))
+            (import "host" "balance" (func $balance (result i64)))
+            (import "host" "order_hosting" (func $order_hosting (param i32) (result i32)))
 
             (func (export "run") (result i64)
-                (i32.const 30)  ;; Pass 30 to order hosting in order to order a month of hosting
+                (i32.const 30)  ;; Pass 30 to $order_hosting in order to order a month of hosting
                 (call $order_hosting)
 
                 ;; Discard the error code
@@ -105,7 +128,9 @@ fn main() {
             )
         )
     "#;
-    let module = Module::new(&engine, wat).unwrap();
+    let mut linker = Linker::<State>::new(&engine);
+
+    wasmtime_wasi::add_to_linker(&mut linker, |s| &mut s.wasi_ctx).unwrap();
     let mut store = {
         let mut user_data = HashMap::new();
 
@@ -117,10 +142,19 @@ fn main() {
             },
         );
 
-        let data = State { user_data };
+        let wasi_ctx = WasiCtxBuilder::new().inherit_stdio().build();
+
+        let data = State {
+            user_data,
+            wasi_ctx,
+        };
         Store::new(&engine, data)
     };
-    let instance = instantiate_services_management_module(&mut store, UserId(0), &module).unwrap();
+
+    let module = Module::new(&engine, wat).unwrap();
+    // let instance = linker.instantiate(&mut store, &module).unwrap();
+    let instance =
+        instantiate_services_management_module(&linker, &mut store, UserId(0), &module).unwrap();
     let run_fn = instance
         .get_typed_func::<(), i64>(&mut store, "run")
         .unwrap();
